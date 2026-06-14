@@ -1,0 +1,576 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_Fingerprint.h>
+#include <Keypad.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <mbedtls/sha256.h>
+
+#include "server_config.h"
+#include "generated_server_config.h"
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+#define FINGERPRINT_RX 16
+#define FINGERPRINT_TX 17
+
+HardwareSerial fingerSerial(1);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+byte rowPins[ROWS] = {1, 2, 3, 4};
+byte colPins[COLS] = {5, 6, 7, 8};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+float currentAmount = 0.0f;
+String currentUserID = "";
+String currentUserName = "";
+bool waitingForFingerprint = false;
+bool waitingForPIN = false;
+String enteredPIN = "";
+
+void displayMainScreen();
+void enterAmountMode();
+void checkFingerprint();
+void verifyPIN();
+void startRegistration();
+bool ensureWiFi();
+bool getUserDetails(uint16_t userID);
+bool enrollFingerprint(uint16_t slotId);
+bool registerUserOnServer(uint16_t slotId, const String &pin);
+bool downloadStoredTemplateHash(uint16_t slotId, String &hashHex);
+String promptNumericInput(const String &title, const String &subtitle, uint8_t maxLength, bool maskInput = false);
+void showMessage(const String &line1, const String &line2 = "", const String &line3 = "", unsigned long pauseMs = 0);
+String maskValue(size_t length);
+String sha256ToHex(const uint8_t *data, size_t len);
+bool readTemplatePacketHash(String &hashHex);
+
+void setup() {
+  Serial.begin(115200);
+
+  lcd.init();
+  lcd.backlight();
+  showMessage("Zeno Pay", "Initializing...");
+
+  fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
+  finger.begin(57600);
+
+  if (!finger.verifyPassword()) {
+    showMessage("Fingerprint ERR", "Check wiring");
+    while (1) {
+      delay(100);
+    }
+  }
+
+  finger.setPacketSize(FINGERPRINT_PACKET_SIZE_64);
+  finger.getParameters();
+
+  if (!ensureWiFi()) {
+    showMessage("WiFi failed", "Restart device");
+    while (1) {
+      delay(100);
+    }
+  }
+
+  showMessage("WiFi Connected", WiFi.localIP().toString(), "", 1500);
+  displayMainScreen();
+}
+
+void loop() {
+  char key = keypad.getKey();
+
+  if (!waitingForFingerprint && !waitingForPIN && key == '#') {
+    enterAmountMode();
+  }
+
+  if (!waitingForFingerprint && !waitingForPIN && key == 'A') {
+    startRegistration();
+  }
+
+  if (waitingForFingerprint) {
+    checkFingerprint();
+  }
+
+  if (waitingForPIN && key) {
+    if (key == '*') {
+      waitingForPIN = false;
+      enteredPIN = "";
+      displayMainScreen();
+    } else if (key == '#') {
+      verifyPIN();
+    } else if (key >= '0' && key <= '9' && enteredPIN.length() < 4) {
+      enteredPIN += key;
+      lcd.setCursor(0, 2);
+      lcd.print("PIN: ");
+      lcd.print(maskValue(enteredPIN.length()));
+      lcd.print("    ");
+    }
+  }
+}
+
+void displayMainScreen() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Zeno Pay Machine");
+  lcd.setCursor(0, 1);
+  lcd.print("# Pay");
+  lcd.setCursor(10, 1);
+  lcd.print("A Register");
+  lcd.setCursor(0, 2);
+  lcd.print("Amount: ");
+  lcd.print(currentAmount, 2);
+  lcd.setCursor(0, 3);
+  lcd.print("HTTPS ready");
+}
+
+void showMessage(const String &line1, const String &line2, const String &line3, unsigned long pauseMs) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  if (line2.length() > 0) {
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+  }
+  if (line3.length() > 0) {
+    lcd.setCursor(0, 2);
+    lcd.print(line3);
+  }
+  if (pauseMs > 0) {
+    delay(pauseMs);
+  }
+}
+
+bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(kWifiSsid, kWifiPassword);
+  showMessage("Connecting WiFi", kWifiSsid);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    lcd.setCursor(0, 2);
+    lcd.print("Please wait...");
+    delay(400);
+  }
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
+String promptNumericInput(const String &title, const String &subtitle, uint8_t maxLength, bool maskInput) {
+  String value = "";
+  showMessage(title, subtitle, "* cancel  # save");
+
+  while (true) {
+    char key = keypad.getKey();
+    if (!key) {
+      delay(20);
+      continue;
+    }
+
+    if (key == '*') {
+      return "";
+    }
+
+    if (key == '#') {
+      if (value.length() > 0) {
+        return value;
+      }
+      continue;
+    }
+
+    if (key >= '0' && key <= '9' && value.length() < maxLength) {
+      value += key;
+    }
+
+    lcd.setCursor(0, 3);
+    lcd.print("                    ");
+    lcd.setCursor(0, 3);
+    if (maskInput) {
+      lcd.print(maskValue(value.length()));
+    } else {
+      lcd.print(value);
+    }
+  }
+}
+
+String maskValue(size_t length) {
+  String masked = "";
+  for (size_t i = 0; i < length; ++i) {
+    masked += '*';
+  }
+  return masked;
+}
+
+void enterAmountMode() {
+  String amountStr = promptNumericInput("Enter Amount", "Digits only", 8, false);
+  if (amountStr.length() == 0) {
+    displayMainScreen();
+    return;
+  }
+
+  currentAmount = amountStr.toFloat();
+  waitingForFingerprint = true;
+  showMessage("Amount Saved", "Scan finger now", String("TZS ") + String(currentAmount, 2));
+}
+
+void checkFingerprint() {
+  uint8_t status = finger.getImage();
+  if (status == FINGERPRINT_NOFINGER) {
+    return;
+  }
+  if (status != FINGERPRINT_OK) {
+    showMessage("Finger read err", "Try again", "", 1000);
+    showMessage("Amount Saved", "Scan finger now", String("TZS ") + String(currentAmount, 2));
+    return;
+  }
+
+  status = finger.image2Tz();
+  if (status != FINGERPRINT_OK) {
+    showMessage("Bad fingerprint", "Place finger well", "", 1200);
+    showMessage("Amount Saved", "Scan finger now", String("TZS ") + String(currentAmount, 2));
+    return;
+  }
+
+  status = finger.fingerFastSearch();
+  if (status != FINGERPRINT_OK) {
+    showMessage("Not recognized", "Register first", "", 1200);
+    showMessage("Amount Saved", "Scan finger now", String("TZS ") + String(currentAmount, 2));
+    return;
+  }
+
+  if (finger.confidence < 50) {
+    showMessage("Low confidence", "Use same finger", "", 1000);
+    showMessage("Amount Saved", "Scan finger now", String("TZS ") + String(currentAmount, 2));
+    return;
+  }
+
+  if (!getUserDetails(finger.fingerID)) {
+    waitingForFingerprint = false;
+    displayMainScreen();
+    return;
+  }
+
+  waitingForFingerprint = false;
+  waitingForPIN = true;
+  enteredPIN = "";
+
+  showMessage(String("User: ") + currentUserName, "Enter 4-digit PIN", "Then press #");
+}
+
+bool getUserDetails(uint16_t userID) {
+  if (!ensureWiFi()) {
+    showMessage("Network error", "WiFi disconnected", "", 1500);
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setCACert(kServerCaCert);
+
+  HTTPClient http;
+  String url = String(kServerBaseUrl) + "/user?id=" + String(userID);
+
+  if (!http.begin(client, url)) {
+    showMessage("HTTPS error", "Server setup bad", "", 1500);
+    return false;
+  }
+
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    showMessage("User not ready", "Register finger", "", 1500);
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getString());
+  http.end();
+
+  if (error) {
+    showMessage("Server JSON err", "Retry payment", "", 1500);
+    return false;
+  }
+
+  if (!doc["registered"].as<bool>()) {
+    showMessage("No server finger", "Register first", "", 1500);
+    return false;
+  }
+
+  currentUserID = doc["id"].as<String>();
+  currentUserName = doc["name"].as<String>();
+  return true;
+}
+
+void verifyPIN() {
+  if (!ensureWiFi()) {
+    showMessage("Network error", "Try again later", "", 1500);
+    waitingForPIN = false;
+    displayMainScreen();
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setCACert(kServerCaCert);
+
+  HTTPClient http;
+  String url = String(kServerBaseUrl) + "/verify";
+
+  if (!http.begin(client, url)) {
+    showMessage("HTTPS error", "Check server cert", "", 1500);
+    waitingForPIN = false;
+    displayMainScreen();
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);
+
+  JsonDocument requestDoc;
+  requestDoc["user_id"] = currentUserID;
+  requestDoc["pin"] = enteredPIN;
+  requestDoc["amount"] = currentAmount;
+  requestDoc["terminal_id"] = kTerminalId;
+
+  String body;
+  serializeJson(requestDoc, body);
+
+  int httpCode = http.POST(body);
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    showMessage("Server Error", "Payment not sent", "", 1500);
+    waitingForPIN = false;
+    displayMainScreen();
+    return;
+  }
+
+  JsonDocument responseDoc;
+  DeserializationError error = deserializeJson(responseDoc, http.getString());
+  http.end();
+
+  if (error) {
+    showMessage("Response error", "Retry payment", "", 1500);
+    waitingForPIN = false;
+    displayMainScreen();
+    return;
+  }
+
+  bool success = responseDoc["success"].as<bool>();
+  String message = responseDoc["message"].as<String>();
+  float balance = responseDoc["balance"].as<float>();
+
+  if (success) {
+    showMessage("Payment Success", message, String("Bal: ") + String(balance, 2), 3000);
+  } else {
+    showMessage("Payment Failed", message, String("Bal: ") + String(balance, 2), 3000);
+  }
+
+  waitingForPIN = false;
+  enteredPIN = "";
+  currentAmount = 0.0f;
+  displayMainScreen();
+}
+
+void startRegistration() {
+  String slotStr = promptNumericInput("Register User ID", "Use 1 to 64", 3, false);
+  if (slotStr.length() == 0) {
+    displayMainScreen();
+    return;
+  }
+
+  uint16_t slotId = slotStr.toInt();
+  if (slotId == 0) {
+    showMessage("Invalid user ID", "Use 1 to 64", "", 1500);
+    displayMainScreen();
+    return;
+  }
+
+  String pin = promptNumericInput("Set User PIN", "4 digits only", 4, true);
+  if (pin.length() != 4) {
+    showMessage("PIN cancelled", "Registration stop", "", 1200);
+    displayMainScreen();
+    return;
+  }
+
+  if (!enrollFingerprint(slotId)) {
+    displayMainScreen();
+    return;
+  }
+
+  if (!registerUserOnServer(slotId, pin)) {
+    displayMainScreen();
+    return;
+  }
+
+  showMessage("Register Success", String("User ID: ") + String(slotId), "Ready to pay", 2500);
+  displayMainScreen();
+}
+
+bool enrollFingerprint(uint16_t slotId) {
+  showMessage("Enroll Finger", "Place finger", "for first scan");
+
+  while (finger.getImage() != FINGERPRINT_OK) {
+    delay(50);
+  }
+
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+    showMessage("First scan bad", "Try again", "", 1500);
+    return false;
+  }
+
+  showMessage("Remove finger", "Wait a second");
+  delay(1500);
+  while (finger.getImage() != FINGERPRINT_NOFINGER) {
+    delay(50);
+  }
+
+  showMessage("Place same finger", "Second scan");
+  while (finger.getImage() != FINGERPRINT_OK) {
+    delay(50);
+  }
+
+  if (finger.image2Tz(2) != FINGERPRINT_OK) {
+    showMessage("Second scan bad", "Try again", "", 1500);
+    return false;
+  }
+
+  if (finger.createModel() != FINGERPRINT_OK) {
+    showMessage("Finger mismatch", "Use same finger", "", 1500);
+    return false;
+  }
+
+  if (finger.storeModel(slotId) != FINGERPRINT_OK) {
+    showMessage("Store failed", "Sensor full/error", "", 1500);
+    return false;
+  }
+
+  return true;
+}
+
+bool registerUserOnServer(uint16_t slotId, const String &pin) {
+  if (!ensureWiFi()) {
+    showMessage("Network error", "Cannot register", "", 1500);
+    return false;
+  }
+
+  String fingerprintHash;
+  if (!downloadStoredTemplateHash(slotId, fingerprintHash)) {
+    showMessage("Hash failed", "Template upload err", "", 1500);
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setCACert(kServerCaCert);
+
+  HTTPClient http;
+  String url = String(kServerBaseUrl) + "/register";
+
+  if (!http.begin(client, url)) {
+    showMessage("HTTPS error", "Check server cert", "", 1500);
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(7000);
+
+  JsonDocument requestDoc;
+  requestDoc["user_id"] = slotId;
+  requestDoc["pin"] = pin;
+  requestDoc["fingerprint_hash"] = fingerprintHash;
+
+  String body;
+  serializeJson(requestDoc, body);
+
+  int httpCode = http.POST(body);
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    showMessage("Server reject", "Registration fail", "", 1500);
+    return false;
+  }
+
+  JsonDocument responseDoc;
+  DeserializationError error = deserializeJson(responseDoc, http.getString());
+  http.end();
+
+  if (error || !responseDoc["success"].as<bool>()) {
+    showMessage("Bad response", "Register again", "", 1500);
+    return false;
+  }
+
+  return true;
+}
+
+bool downloadStoredTemplateHash(uint16_t slotId, String &hashHex) {
+  if (finger.loadModel(slotId) != FINGERPRINT_OK) {
+    return false;
+  }
+
+  if (finger.getModel() != FINGERPRINT_OK) {
+    return false;
+  }
+
+  return readTemplatePacketHash(hashHex);
+}
+
+bool readTemplatePacketHash(String &hashHex) {
+  uint8_t packetSeed[64] = {0};
+  Adafruit_Fingerprint_Packet packet(FINGERPRINT_DATAPACKET, sizeof(packetSeed), packetSeed);
+
+  mbedtls_sha256_context shaContext;
+  mbedtls_sha256_init(&shaContext);
+  mbedtls_sha256_starts_ret(&shaContext, 0);
+
+  while (true) {
+    if (finger.getStructuredPacket(&packet, 2000) != FINGERPRINT_OK) {
+      mbedtls_sha256_free(&shaContext);
+      return false;
+    }
+
+    if (packet.type != FINGERPRINT_DATAPACKET && packet.type != FINGERPRINT_ENDDATAPACKET) {
+      mbedtls_sha256_free(&shaContext);
+      return false;
+    }
+
+    size_t payloadSize = packet.length >= 2 ? packet.length - 2 : 0;
+    if (payloadSize > 0) {
+      mbedtls_sha256_update_ret(&shaContext, packet.data, payloadSize);
+    }
+
+    if (packet.type == FINGERPRINT_ENDDATAPACKET) {
+      break;
+    }
+  }
+
+  uint8_t hashBytes[32];
+  mbedtls_sha256_finish_ret(&shaContext, hashBytes);
+  mbedtls_sha256_free(&shaContext);
+
+  hashHex = sha256ToHex(hashBytes, sizeof(hashBytes));
+  return true;
+}
+
+String sha256ToHex(const uint8_t *data, size_t len) {
+  static const char hexChars[] = "0123456789abcdef";
+  String value;
+  value.reserve(len * 2);
+
+  for (size_t i = 0; i < len; ++i) {
+    value += hexChars[(data[i] >> 4) & 0x0F];
+    value += hexChars[data[i] & 0x0F];
+  }
+
+  return value;
+}
